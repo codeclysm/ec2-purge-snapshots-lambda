@@ -1,7 +1,10 @@
-from __future__ import print_function
+import logging
 from datetime import datetime, timedelta
 from dateutil import parser, relativedelta, tz
 from boto3 import resource
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 def main(event, context):
     event = validate_event(event)
@@ -20,9 +23,14 @@ def main(event, context):
     elif "volume_tags" in event:
         pass
 
+    errors = []
+
     for volume in volumes:
-        print(volume)
-        purge_snapshots(ec2, volume, event)
+        logger.info(volume)
+        errors += purge_snapshots(ec2, volume, event)
+
+    if len(errors) > 0:
+        raise Exception("errors during the purge")
 
 def validate_event(event):
     if "volumes" not in event and "volume_tags" not in event:
@@ -47,6 +55,8 @@ def validate_event(event):
         event["weeks"] = 0
     if "months" not in event:
         event["months"] = 0
+    if "years" not in event:
+        event["years"] = 0
     return event
 
 def purge_snapshots(ec2, volume, event):
@@ -56,6 +66,7 @@ def purge_snapshots(ec2, volume, event):
     days_threshold = event["time"] - relativedelta.relativedelta(days=event["days"])
     weeks_threshold = event["time"] - relativedelta.relativedelta(weeks=event["weeks"])
     months_threshold = event["time"] - relativedelta.relativedelta(months=event["months"])
+    years_threshold = event["time"] - relativedelta.relativedelta(years=event["years"])
 
     ## Uncomment to test
     # event["dry_run"] = True
@@ -83,16 +94,20 @@ def purge_snapshots(ec2, volume, event):
     #     snap.start_time = parser.parse(snap.start_time).astimezone(tz.gettz(event["timezone"]))
     ## End Uncomment to test
 
+    if len(snaps) <= 0:
+        return []
+
     newest = snaps[-1]
 
     kept = []
+    errors = []
 
     for snap in snaps:
         snap_date = snap.start_time.astimezone(tz.gettz(event["timezone"]))
         snap_age = relativedelta.relativedelta(event["time"], snap_date)
         # Always keep the last snapshot
         if snap.snapshot_id == newest.snapshot_id:
-            print(("- Keeping {}: {}, {} hours old - will never"
+            logger.info(("- Keeping {}: {}, {} hours old - will never"
                   " delete newest snapshot").format(
                   snap.snapshot_id, snap_date,
                   snap_age.seconds/3600)
@@ -100,7 +115,7 @@ def purge_snapshots(ec2, volume, event):
             continue
         # Keep snapshots younger than hour threshold
         if snap_date > hours_threshold:
-            print("- Keeping {}: {}, {} hours old - {}-hour threshold".format(
+            logger.info("- Keeping {}: {}, {} hours old - {}-hour threshold".format(
                   snap.snapshot_id, snap_date, snap_age.seconds/3600, event["hours"])
                   )
             continue
@@ -110,7 +125,7 @@ def purge_snapshots(ec2, volume, event):
             first_day = parser.parse(first_day_str)
             if first_day_str not in kept:
                 kept.append(first_day_str)
-                print("- Keeping {}: {}, {} days old - day of {}".format(
+                logger.info("- Keeping {}: {}, {} days old - day of {}".format(
                       snap.snapshot_id, snap_date, snap_age.days, first_day_str)
                       )
                 continue
@@ -121,29 +136,46 @@ def purge_snapshots(ec2, volume, event):
             first_day_str = first_day.strftime("%Y-%m-%d")
             if first_day_str not in kept:
                 kept.append(first_day_str)
-                print("- Keeping {}: {}, {} days old - day of {}".format(
+                logger.info("- Keeping {}: {}, {} days old - day of {}".format(
                       snap.snapshot_id, snap_date, snap_age.days, first_day_str)
                       )
                 continue
         # Keep a snapshot per month until the month_threshold
         elif snap_date > months_threshold:
             first_day = datetime(snap_date.year, snap_date.month, 1)
-            first_day_str = first_day.strftime("%Y-%m-%d")
+            first_day_str = first_day.strftime("%Y-%m")
             if first_day_str not in kept:
                 kept.append(first_day_str)
-                print("- Keeping {}: {}, {} months old - month of {}".format(
+                logger.info("- Keeping {}: {}, {} months old - month of {}".format(
                       snap.snapshot_id, snap_date, snap_age.months, first_day_str)
+                      )
+                continue
+        # Keep a snapshot per year until the year_threshold
+        elif snap_date > years_threshold:
+            first_day = datetime(snap_date.year, 1, 1)
+            first_day_str = first_day.strftime("%Y")
+            if first_day_str not in kept:
+                kept.append(first_day_str)
+                logger.info("- Keeping {}: {}, {} years old - year of {}".format(
+                      snap.snapshot_id, snap_date, snap_age.years, first_day_str)
                       )
                 continue
 
         # Delete snapshot
+        not_really = ""
         if event["dry_run"]:
             not_really = " (not really)"
-        else:
-            not_really = ""
-            snap.delete()
 
-        print("--- Deleting{} {}: {}".format(not_really, snap.snapshot_id, snap_date))
+        logger.info("--- Deleting{} {}: {}".format(not_really, snap.snapshot_id, snap_date))
+
+        try:
+            if not event["dry_run"]:
+                snap.delete()
+        except Exception as e:
+            logger.error(e)
+            errors.append(e)
+    return errors
+
 
 def get_snapshots(ec2, volume, volume_tags):
     collection_filter = [
